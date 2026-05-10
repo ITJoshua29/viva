@@ -1,0 +1,15 @@
+# ── Backend ──────────────────────────────
+backend/node_modules/
+backend/.env
+backend/fix-db.js
+
+# ── Frontend ─────────────────────────────
+Hotel-Management/node_modules/
+Hotel-Management/dist/
+Hotel-Management/.angular/
+
+# ── OS / Editor ──────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
