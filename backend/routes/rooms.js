@@ -94,4 +94,51 @@ router.put('/:room/maintenance', authenticate, requireAdmin, async (req, res) =>
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/rooms/:room/checkout   (admin only)
+// Force-marks an Occupied room as Available by cancelling its active reservation.
+// Used when a guest has physically checked out and admin needs to free the room.
+// ─────────────────────────────────────────────────────────────────────────────
+router.put('/:room/checkout', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const room = decodeURIComponent(req.params.room);
+
+    // Find active reservation(s) for this room
+    const [activeRes] = await pool.query(
+      `SELECT id FROM reservations
+       WHERE room = ? AND status IN ('Pending', 'Approved')`,
+      [room]
+    );
+
+    if (activeRes.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Room "${room}" has no active reservation to clear.`,
+      });
+    }
+
+    // Cancel all active reservations for this room
+    const ids = activeRes.map(r => r.id);
+    await pool.query(
+      `UPDATE reservations SET status = 'Cancelled' WHERE id IN (?)`,
+      [ids]
+    );
+
+    // Also delete associated billing records to keep things clean
+    await pool.query(
+      `DELETE FROM billings WHERE reservation_id IN (?)`,
+      [ids]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Room "${room}" has been marked as Available. ${ids.length} reservation(s) cancelled.`,
+      data: { room, cancelledReservations: ids.length },
+    });
+  } catch (err) {
+    console.error('[Rooms] PUT /:room/checkout error:', err);
+    return res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
 module.exports = router;

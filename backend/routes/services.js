@@ -160,6 +160,7 @@ router.put('/:id/approve', authenticate, requireAdmin, async (req, res) => {
 router.put('/:id/reject', authenticate, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    const { reason } = req.body; // admin's rejection reason
 
     const [rows] = await pool.execute(
       `SELECT sr.*, u.email AS user_email, u.full_name AS user_full_name
@@ -170,53 +171,41 @@ router.put('/:id/reject', authenticate, requireAdmin, async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Service request not found.',
-      });
+      return res.status(404).json({ success: false, message: 'Service request not found.' });
     }
 
     const serviceRequest = rows[0];
 
     if (serviceRequest.status === 'Rejected') {
-      return res.status(400).json({
-        success: false,
-        message: 'Service request is already rejected.',
-      });
+      return res.status(400).json({ success: false, message: 'Service request is already rejected.' });
     }
 
-    // Update status to Rejected — we use 'Pending' as the starting state and allow
-    // rejection only from Pending (business rule: once Approved, reject via delete/re-create)
+    // Save status + reason atomically
     await pool.execute(
-      "UPDATE service_requests SET status = 'Pending' WHERE id = ?",
-      [id]
+      "UPDATE service_requests SET status = 'Rejected', rejection_reason = ? WHERE id = ?",
+      [reason || null, id]
     );
 
-    // For the schema we store 'Pending','Approved','Completed'; rejection sends email and resets to Pending
-    // If your schema has a 'Rejected' ENUM value, update the query above accordingly.
-
-    // Send rejection email (non-blocking on failure)
+    // Notify guest with the reason
     await sendRejectionEmail(
       serviceRequest.user_email,
       serviceRequest.user_full_name,
       'service request',
       {
-        'Room':         serviceRequest.room,
-        'Request Type': serviceRequest.request_type,
-        'Details':      serviceRequest.details || 'N/A',
+        'Room':             serviceRequest.room,
+        'Request Type':     serviceRequest.request_type,
+        'Details':          serviceRequest.details || 'N/A',
+        'Rejection Reason': reason || 'No reason provided.',
       }
     );
 
     return res.status(200).json({
       success: true,
-      message: 'Service request rejected and user notified.',
+      message: 'Service request rejected and guest notified.',
     });
   } catch (err) {
     console.error('[Services] PUT /:id/reject error:', err);
-    return res.status(500).json({
-      success: false,
-      message: 'An internal server error occurred.',
-    });
+    return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
   }
 });
 

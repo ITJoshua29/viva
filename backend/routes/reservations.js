@@ -193,101 +193,90 @@ router.post("/", authenticate, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/reservations/:id/approve   (admin only)
-// Approves a reservation and creates a billing record
+// ACID: Wrapped in a transaction — reservation update + billing insert are atomic
 // ─────────────────────────────────────────────────────────────────────────────
 router.put("/:id/approve", authenticate, requireAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
   try {
+    await conn.beginTransaction();
+
     const { id } = req.params;
 
-    // Get reservation with user info
-    const [rows] = await pool.execute(
+    // Lock the row to prevent concurrent approvals (Isolation)
+    const [rows] = await conn.execute(
       `SELECT r.*, u.email AS user_email, u.full_name AS user_full_name
        FROM reservations r
        JOIN users u ON r.user_id = u.id
-       WHERE r.id = ?`,
+       WHERE r.id = ? FOR UPDATE`,
       [id],
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Reservation not found.",
-      });
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Reservation not found." });
     }
 
     const reservation = rows[0];
 
     if (reservation.status === "Approved") {
-      return res.status(400).json({
-        success: false,
-        message: "Reservation is already approved.",
-      });
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "Reservation is already approved." });
     }
 
-    // Update reservation status
-    await pool.execute(
+    // 1) Update reservation status (Atomicity — part 1)
+    await conn.execute(
       "UPDATE reservations SET status = 'Approved' WHERE id = ?",
       [id],
     );
 
-    // Calculate billing
+    // 2) Create billing record only if one does not exist (Consistency)
     const totalAmount = getRoomPrice(reservation.room);
-    const dueDate = reservation.check_out; // due on check-out date
-    const balance = totalAmount;
+    const dueDate    = reservation.check_out;
 
-    // Check if billing already exists for this reservation
-    const [existingBilling] = await pool.execute(
+    const [existingBilling] = await conn.execute(
       "SELECT id FROM billings WHERE reservation_id = ?",
       [id],
     );
 
     if (existingBilling.length === 0) {
-      await pool.execute(
+      // Atomicity — part 2: billing insert is inside the same transaction
+      await conn.execute(
         `INSERT INTO billings
            (reservation_id, user_id, guest_name, room, total_amount, paid_amount, balance, due_date, status)
          VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'Unpaid')`,
-        [
-          id,
-          reservation.user_id,
-          reservation.guest_name,
-          reservation.room,
-          totalAmount,
-          balance,
-          dueDate,
-        ],
+        [id, reservation.user_id, reservation.guest_name, reservation.room, totalAmount, totalAmount, dueDate],
       );
     }
 
-    // Send approval email (non-blocking on failure)
-    await sendApprovalEmail(
+    // Commit — both writes are durable together (Durability)
+    await conn.commit();
+
+    // Email is sent AFTER commit so a mail failure never rolls back DB changes
+    sendApprovalEmail(
       reservation.user_email,
       reservation.user_full_name,
       "reservation",
       {
         "Guest Name": reservation.guest_name,
         Room: reservation.room,
-        "Check-in": reservation.check_in,
+        "Check-in":  reservation.check_in,
         "Check-out": reservation.check_out,
         "Total Bill": `PHP ${totalAmount.toLocaleString()}`,
-        "Due Date": dueDate,
+        "Due Date":  dueDate,
       },
-    );
+    ).catch((emailErr) => console.error("[Reservations] Approval email failed:", emailErr.message));
 
     return res.status(200).json({
       success: true,
       message: "Reservation approved and billing record created.",
-      data: {
-        reservationId: parseInt(id),
-        billingTotal: totalAmount,
-        dueDate,
-      },
+      data: { reservationId: parseInt(id), billingTotal: totalAmount, dueDate },
     });
   } catch (err) {
+    await conn.rollback(); // Atomicity — undo all changes if any step fails
     console.error("[Reservations] PUT /:id/approve error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "An internal server error occurred.",
-    });
+    return res.status(500).json({ success: false, message: "An internal server error occurred." });
+  } finally {
+    conn.release(); // Always return connection to pool
   }
 });
 
@@ -357,53 +346,49 @@ router.put("/:id/reject", authenticate, requireAdmin, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /api/reservations/:id
-// Deletes a reservation (owner or admin)
-// Also deletes associated billing record if it exists
+// ACID: Wrapped in a transaction — billing delete + reservation delete are atomic
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete("/:id", authenticate, async (req, res) => {
+  const conn = await pool.getConnection();
   try {
+    await conn.beginTransaction();
+
     const { id } = req.params;
 
-    const [rows] = await pool.execute(
-      "SELECT * FROM reservations WHERE id = ?",
+    // Lock row to prevent concurrent deletes (Isolation)
+    const [rows] = await conn.execute(
+      "SELECT * FROM reservations WHERE id = ? FOR UPDATE",
       [id],
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Reservation not found.",
-      });
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Reservation not found." });
     }
 
     const reservation = rows[0];
 
-    // Authorization: owner or admin only
     if (req.user.role !== "admin" && reservation.user_id !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Forbidden. You do not have permission to delete this reservation.",
-      });
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: "Forbidden. You do not have permission to delete this reservation." });
     }
 
-    // Delete associated billing (if any) — also handled by FK ON DELETE SET NULL,
-    // but we delete explicitly for a clean audit trail
-    await pool.execute("DELETE FROM billings WHERE reservation_id = ?", [id]);
+    // 1) Delete associated billing (Atomicity — part 1)
+    await conn.execute("DELETE FROM billings WHERE reservation_id = ?", [id]);
 
-    // Delete the reservation
-    await pool.execute("DELETE FROM reservations WHERE id = ?", [id]);
+    // 2) Delete the reservation (Atomicity — part 2)
+    await conn.execute("DELETE FROM reservations WHERE id = ?", [id]);
 
-    return res.status(200).json({
-      success: true,
-      message: "Reservation deleted successfully.",
-    });
+    // Both deletes committed together (Durability)
+    await conn.commit();
+
+    return res.status(200).json({ success: true, message: "Reservation deleted successfully." });
   } catch (err) {
+    await conn.rollback(); // Atomicity — undo both deletes if either fails
     console.error("[Reservations] DELETE /:id error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "An internal server error occurred.",
-    });
+    return res.status(500).json({ success: false, message: "An internal server error occurred." });
+  } finally {
+    conn.release();
   }
 });
 

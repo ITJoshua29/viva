@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS users (
   role             ENUM('user', 'admin') NOT NULL DEFAULT 'user',
   reset_token      VARCHAR(255) DEFAULT NULL,
   reset_expires    BIGINT DEFAULT NULL,
+  change_pw_token  VARCHAR(255) DEFAULT NULL,
+  change_pw_hash   VARCHAR(255) DEFAULT NULL,
+  change_pw_expires BIGINT DEFAULT NULL,
   created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -40,7 +43,7 @@ CREATE TABLE IF NOT EXISTS reservations (
   room         VARCHAR(50) NOT NULL,
   check_in     DATE NOT NULL,
   check_out    DATE NOT NULL,
-  status       ENUM('Pending', 'Approved', 'Rejected') NOT NULL DEFAULT 'Pending',
+  status       ENUM('Pending', 'Approved', 'Rejected', 'Cancelled') NOT NULL DEFAULT 'Pending',
   created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_reservations_user
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -55,7 +58,7 @@ CREATE TABLE IF NOT EXISTS service_requests (
   room          VARCHAR(50) NOT NULL,
   request_type  VARCHAR(100) NOT NULL,
   details       TEXT,
-  status        ENUM('Pending', 'Approved', 'Completed') NOT NULL DEFAULT 'Pending',
+  status        ENUM('Pending', 'Approved', 'Completed', 'Rejected') NOT NULL DEFAULT 'Pending',
   created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_service_requests_user
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -83,14 +86,44 @@ CREATE TABLE IF NOT EXISTS billings (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
--- Indexes for performance
+-- TABLE: room_statuses
 -- ============================================================
-CREATE INDEX IF NOT EXISTS idx_reservations_user_id  ON reservations(user_id);
-CREATE INDEX IF NOT EXISTS idx_reservations_room      ON reservations(room);
-CREATE INDEX IF NOT EXISTS idx_service_requests_user  ON service_requests(user_id);
-CREATE INDEX IF NOT EXISTS idx_billings_user_id       ON billings(user_id);
-CREATE INDEX IF NOT EXISTS idx_billings_reservation   ON billings(reservation_id);
-CREATE INDEX IF NOT EXISTS idx_users_reset_token      ON users(reset_token);
+CREATE TABLE IF NOT EXISTS room_statuses (
+  room_number        VARCHAR(50) NOT NULL PRIMARY KEY,
+  maintenance_status ENUM('Available','Under Repair') NOT NULL DEFAULT 'Available',
+  notes              TEXT DEFAULT NULL,
+  updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- Indexes for performance (safe for re-runs)
+-- ============================================================
+DROP PROCEDURE IF EXISTS create_indexes;
+DELIMITER //
+CREATE PROCEDURE create_indexes()
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='reservations' AND index_name='idx_reservations_user_id') THEN
+    CREATE INDEX idx_reservations_user_id ON reservations(user_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='reservations' AND index_name='idx_reservations_room') THEN
+    CREATE INDEX idx_reservations_room ON reservations(room);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='service_requests' AND index_name='idx_service_requests_user') THEN
+    CREATE INDEX idx_service_requests_user ON service_requests(user_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='billings' AND index_name='idx_billings_user_id') THEN
+    CREATE INDEX idx_billings_user_id ON billings(user_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='billings' AND index_name='idx_billings_reservation') THEN
+    CREATE INDEX idx_billings_reservation ON billings(reservation_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS WHERE table_schema=DATABASE() AND table_name='users' AND index_name='idx_users_reset_token') THEN
+    CREATE INDEX idx_users_reset_token ON users(reset_token);
+  END IF;
+END //
+DELIMITER ;
+CALL create_indexes();
+DROP PROCEDURE IF EXISTS create_indexes;
 
 -- ============================================================
 -- Default Admin User

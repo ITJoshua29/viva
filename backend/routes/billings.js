@@ -35,8 +35,8 @@ async function syncOverdueStatuses() {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/", authenticate, async (req, res) => {
   try {
-    // Sync overdue statuses before fetching
-    await syncOverdueStatuses();
+    // Fire-and-forget — don't block the response waiting for overdue sync
+    syncOverdueStatuses().catch(() => {});
 
     let rows;
 
@@ -73,115 +73,115 @@ router.get("/", authenticate, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/billings/:id/pay
-// Processes a payment (partial or full) for a billing record
-// Body: { paymentType: 'partial' | 'full' }
+// ACID: SELECT FOR UPDATE prevents race conditions on concurrent payments
+// Body: { paymentType: 'partial' | 'full', amount?: number, paymentMethod?: 'gcash' | 'cash' }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/pay", authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { paymentType, paymentMethod, amount } = req.body;
+
+  if (!paymentType || !["partial", "full"].includes(paymentType)) {
+    return res.status(400).json({ success: false, message: 'paymentType must be "partial" or "full".' });
+  }
+
+  const conn = await pool.getConnection();
   try {
-    const { id } = req.params;
-    const { paymentType } = req.body;
+    await conn.beginTransaction();
 
-    if (!paymentType || !["partial", "full"].includes(paymentType)) {
-      return res.status(400).json({
-        success: false,
-        message: 'paymentType must be "partial" or "full".',
-      });
-    }
-
-    // Fetch the billing record
-    const [rows] = await pool.execute("SELECT * FROM billings WHERE id = ?", [
-      id,
-    ]);
+    // Lock billing row — prevents two simultaneous payments (Isolation)
+    const [rows] = await conn.execute(
+      "SELECT * FROM billings WHERE id = ? FOR UPDATE",
+      [id],
+    );
 
     if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Billing record not found.",
-      });
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Billing record not found." });
     }
 
     const billing = rows[0];
 
-    // Authorization: owner or admin
     if (req.user.role !== "admin" && billing.user_id !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden. You do not have permission to pay this billing.",
-      });
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: "Forbidden. You do not have permission to pay this billing." });
     }
 
     if (billing.status === "Paid") {
-      return res.status(400).json({
-        success: false,
-        message: "This billing has already been fully paid.",
-      });
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "This billing has already been fully paid." });
     }
 
-    const totalAmount = parseFloat(billing.total_amount);
-    let paidAmount = parseFloat(billing.paid_amount);
-    let balance;
-    let newStatus;
+    // ── Calculate amounts (Consistency) ──────────────────────────────────────
+    const totalAmount    = parseFloat(billing.total_amount);
+    let   paidAmount     = parseFloat(billing.paid_amount);
+    const currentBalance = parseFloat(billing.balance);
+    let   balance, newStatus;
 
     if (paymentType === "full") {
-      // Full payment: clear entire balance
       paidAmount = totalAmount;
-      balance = 0;
-      newStatus = "Paid";
+      balance    = 0;
+      newStatus  = "Paid";
     } else {
-      // Partial payment: pay half of the total amount
-      const partialPayment = totalAmount / 2;
-      paidAmount = Math.min(paidAmount + partialPayment, totalAmount);
-      balance = totalAmount - paidAmount;
-
-      if (balance <= 0) {
-        balance = 0;
-        newStatus = "Paid";
+      let partialPayment;
+      if (amount && !isNaN(parseFloat(amount))) {
+        partialPayment = parseFloat(amount);
+        if (partialPayment <= 0) {
+          await conn.rollback();
+          return res.status(400).json({ success: false, message: "Payment amount must be greater than zero." });
+        }
+        if (partialPayment > currentBalance) {
+          await conn.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Amount (${partialPayment.toFixed(2)}) cannot exceed balance (${currentBalance.toFixed(2)}).`,
+          });
+        }
       } else {
-        newStatus = "Partial";
+        partialPayment = totalAmount / 2;
       }
+      paidAmount = Math.min(paidAmount + partialPayment, totalAmount);
+      balance    = totalAmount - paidAmount;
+      newStatus  = balance <= 0 ? (balance = 0, "Paid") : "Partial";
     }
 
-    // Update the billing record
-    await pool.execute(
+    // ── Persist payment (Atomicity) ───────────────────────────────────────────
+    await conn.execute(
       "UPDATE billings SET paid_amount = ?, balance = ?, status = ? WHERE id = ?",
       [paidAmount.toFixed(2), balance.toFixed(2), newStatus, id],
     );
 
-    // Fetch updated record
+    // Commit — changes are durable (Durability)
+    await conn.commit();
+
+    // Fetch updated record after commit
     const [updatedRows] = await pool.execute(
       `SELECT b.*, u.email AS user_email, u.full_name AS user_full_name
-       FROM billings b
-       JOIN users u ON b.user_id = u.id
-       WHERE b.id = ?`,
+       FROM billings b JOIN users u ON b.user_id = u.id WHERE b.id = ?`,
       [id],
     );
-
     const updated = updatedRows[0];
 
-    // Send payment receipt email to user (non-blocking)
-    await sendPaymentReceiptEmail(
-      updated.user_email,
-      updated.user_full_name,
-      updated.room,
-      paymentType,
-      paidAmount.toFixed(2),
-      balance.toFixed(2),
-      newStatus,
-    );
+    // Email sent AFTER commit — failure never rolls back the payment
+    sendPaymentReceiptEmail(
+      updated.user_email, updated.user_full_name, updated.room,
+      paymentType, paidAmount.toFixed(2), balance.toFixed(2), newStatus,
+    ).catch((e) => console.error("[Billings] Receipt email failed:", e.message));
 
     return res.status(200).json({
       success: true,
-      message: `Payment processed successfully. Status: ${newStatus}.`,
+      message: `Payment processed via ${paymentMethod || "cash"}. Status: ${newStatus}.`,
       data: updated,
+      paymentMethod: paymentMethod || "cash",
     });
   } catch (err) {
+    await conn.rollback(); // Atomicity — undo if anything fails
     console.error("[Billings] POST /:id/pay error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "An internal server error occurred.",
-    });
+    return res.status(500).json({ success: false, message: "An internal server error occurred." });
+  } finally {
+    conn.release();
   }
 });
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/billings/:id/due-date   (admin only)

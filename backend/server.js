@@ -17,10 +17,20 @@ const PORT = process.env.PORT || 3000;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
-// CORS — allow Angular dev server (port 4200) with credentials and custom headers
+// CORS — allow any localhost origin (Angular can start on any port)
+const allowedOrigin = (origin, callback) => {
+  if (!origin || /^http:\/\/localhost(:\d+)?$/.test(origin)) {
+    return callback(null, true);
+  }
+  if (process.env.APP_URL && origin === process.env.APP_URL) {
+    return callback(null, true);
+  }
+  callback(new Error("CORS: origin not allowed — " + origin));
+};
+
 app.use(
   cors({
-    origin: process.env.APP_URL || "http://localhost:4200",
+    origin: allowedOrigin,
     credentials: true,
     allowedHeaders: ["Authorization", "Content-Type"],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -74,14 +84,12 @@ app.use((err, req, res, next) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log("╔══════════════════════════════════════════════╗");
   console.log("║         MaxViva Hotel — Backend API          ║");
   console.log("╚══════════════════════════════════════════════╝");
   console.log(`  ✅  Server running on http://localhost:${PORT}`);
-  console.log(
-    `  📡  CORS origin  : ${process.env.APP_URL || "http://localhost:4200"}`,
-  );
+  console.log(`  📡  CORS origin  : all localhost ports${process.env.APP_URL ? ' + ' + process.env.APP_URL : ''}`);
   console.log(`  🌍  Environment  : ${process.env.NODE_ENV || "development"}`);
   console.log("──────────────────────────────────────────────");
   console.log("  Available endpoints:");
@@ -114,4 +122,15 @@ app.listen(PORT, () => {
   console.log("──────────────────────────────────────────────");
 });
 
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`\n❌  Port ${PORT} is already in use.`);
+    console.error(`   Stop the other process first, then restart.\n`);
+    process.exit(1);
+  } else {
+    throw err;
+  }
+});
+
 module.exports = app;
+
